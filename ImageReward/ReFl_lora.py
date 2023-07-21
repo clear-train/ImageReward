@@ -14,7 +14,6 @@ import math
 import os
 import random
 from pathlib import Path
-
 import accelerate
 import numpy as np
 import torch
@@ -33,6 +32,7 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 import io
+
 from PIL import Image
 import ImageReward as RM
 
@@ -106,7 +106,20 @@ def parse_args():
         help="The column of the dataset containing a caption or a list of captions.",
     )
     parser.add_argument(
-        "--validation_prompt", type=str, default=None, help="A prompt that is sampled during training for inference."
+        "--max_train_samples",
+        type=int,
+        default=None,
+        help=(
+            "For debugging purposes or quicker training, truncate the number of training examples to this "
+            "value if set."
+        ),
+    )
+    parser.add_argument(
+        "--validation_prompt", 
+        type=str, 
+        default=None, 
+        nargs="+",
+        help="A prompt that is sampled during training for inference."
     )
     parser.add_argument(
         "--validation_epochs",
@@ -307,10 +320,6 @@ def parse_args():
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
-    # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Need either a dataset name or a training folder.")
-
     return args
 
 
@@ -321,15 +330,6 @@ class Trainer(object):
         if args.dataset_name is None and self.train_data_dir is None:
             raise ValueError("Need either a dataset name or a training folder.")
 
-        if args.non_ema_revision is not None:
-            deprecate(
-                "non_ema_revision!=None",
-                "0.15.0",
-                message=(
-                    "Downloading 'non_ema' weights from revision branches of the Hub is deprecated. Please make sure to"
-                    " use `--variant=non_ema` instead."
-                ),
-            )
         logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
         accelerator_project_config = ProjectConfiguration(total_limit=args.checkpoints_total_limit)
@@ -380,14 +380,16 @@ class Trainer(object):
         )
         self.vae = AutoencoderKL.from_pretrained(self.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
         self.unet = UNet2DConditionModel.from_pretrained(
-            self.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
+            self.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
         )
         self.reward_model = RM.load("ImageReward-v1.0", device=self.accelerator.device)
 
-        # Freeze vae and text_encoder
+        # Freeze unet, vae, reward_model and text_encoder
         self.vae.requires_grad_(False)
         self.text_encoder.requires_grad_(False)
+        self.unet.requires_grad_(False)
         self.reward_model.requires_grad_(False)
+        
         # For mixed precision training we cast the text_encoder and vae weights to half-precision
         # as these models are only used for inference, keeping weights in full precision is not required.
         self.weight_dtype = torch.float32
@@ -396,7 +398,7 @@ class Trainer(object):
         elif self.accelerator.mixed_precision == "bf16":
             self.weight_dtype = torch.bfloat16
 
-        # Move text_encode and vae to gpu and cast to self.weight_dtype
+        # Move unet, vae and text_encoder to device and cast to weight_dtype
         self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
         self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
         self.unet.to(self.accelerator.device, dtype=self.weight_dtype)
@@ -418,7 +420,7 @@ class Trainer(object):
         # Set correct lora layers
         lora_attn_procs = {}
         for name in self.unet.attn_processors.keys():
-            cross_attention_dim = None if name.endswith("attn1.processor") else self.unetunet.config.cross_attention_dim
+            cross_attention_dim = None if name.endswith("attn1.processor") else self.unet.config.cross_attention_dim
             if name.startswith("mid_block"):
                 hidden_size = self.unet.config.block_out_channels[-1]
             elif name.startswith("up_blocks"):
@@ -438,7 +440,6 @@ class Trainer(object):
         if args.enable_xformers_memory_efficient_attention:
             if is_xformers_available():
                 import xformers
-
                 xformers_version = version.parse(xformers.__version__)
                 if xformers_version == version.parse("0.0.16"):
                     logger.warn(
@@ -587,19 +588,6 @@ class Trainer(object):
         self.lora_layers, self.optimizer, self.train_dataloader, self.lr_scheduler = self.accelerator.prepare(
             self.lora_layers, self.optimizer, self.train_dataloader, self.lr_scheduler
         )
-        # For mixed precision training we cast the text_encoder and vae weights to half-precision
-        # as these models are only used for inference, keeping weights in full precision is not required.
-        self.weight_dtype = torch.float32
-        if self.accelerator.mixed_precision == "fp16":
-            self.weight_dtype = torch.float16
-        elif self.accelerator.mixed_precision == "bf16":
-            self.weight_dtype = torch.bfloat16
-
-        # Move text_encode and vae to gpu and cast to self.weight_dtype
-        self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
-        self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
-        self.reward_model.to(self.accelerator.device, dtype=self.weight_dtype)
-
         # We need to recalculate our total training steps as the size of the training dataloader may have changed.
         self.num_update_steps_per_epoch = math.ceil(len(self.train_dataloader) / args.gradient_accumulation_steps)
         if overrode_max_train_steps:
@@ -607,12 +595,10 @@ class Trainer(object):
         # Afterwards we recalculate our number of training epochs
         args.num_train_epochs = math.ceil(args.max_train_steps / self.num_update_steps_per_epoch)
 
-        # We need to initialize the trackers we use, and also store our configuration.
+       # We need to initialize the trackers we use, and also  store our configuration.
         # The trackers initializes automatically on the main process.
         if self.accelerator.is_main_process:
-            tracker_config = dict(vars(args))
-            tracker_config.pop("validation_prompts")
-            self.accelerator.init_trackers(args.tracker_project_name, tracker_config)
+            self.accelerator.init_trackers("ImageReward-lora-fine-tune", config=vars(args))
 
     def train(self, args):
 
@@ -671,8 +657,7 @@ class Trainer(object):
 
                 with self.accelerator.accumulate(self.unet):
                     encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
-                    latents = torch.randn((args.train_batch_size, 4, 64, 64), device=self.accelerator.device)
-
+                    latents = torch.randn((args.train_batch_size, 4, 64, 64), device=self.accelerator.device).to(dtype=self.weight_dtype)
                     self.noise_scheduler.set_timesteps(40, device=self.accelerator.device)
                     timesteps = self.noise_scheduler.timesteps
 
@@ -750,7 +735,7 @@ class Trainer(object):
                     break
 
             if self.accelerator.is_main_process:
-                if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
+                if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
                     logger.info(
                         f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
                         f" {args.validation_prompt}."
